@@ -17,6 +17,10 @@ struct ElementDescriptor {
     namespace: syn::Path,
     name: String,
 
+    content: Option<syn::Path>,
+
+    setup_prefixes: Option<bool>,
+
     #[darling(multiple)]
     attribute: Vec<ElementAttribute>,
     
@@ -33,15 +37,33 @@ struct ElementChild {
 
 impl ElementChild {
     pub fn get_attribute_name(&self) -> String {
-        self.r#type.get_ident().unwrap().to_string().to_case(Case::Snake)
+        let att_name = self.r#type.get_ident().expect("Cannot get attribute name").to_string().to_case(Case::Snake);
+        
+        if att_name == "type" {
+            return "r#type".to_string();
+        }
+
+        att_name
     }
 }
 
 #[derive(FromMeta, Debug)]
 struct ElementAttribute {
-    name: syn::Ident,
+    name: String,
     r#type: syn::Ident,
     prefix: String
+}
+
+impl ElementAttribute {
+    pub fn get_attribute_name(&self) -> syn::Ident {
+        let name = self.name.to_case(Case::Snake);
+        if name == "type" {
+            return syn::Ident::new(&"ttype", self.r#type.span())
+        }
+
+        syn::Ident::new(&self.name.to_case(Case::Snake), self.r#type.span())
+        
+    }
 }
 
 fn add_fields_to_struct(mut ast: DeriveInput, fields: &[TokenStream2]) -> TokenStream2 {
@@ -51,7 +73,7 @@ fn add_fields_to_struct(mut ast: DeriveInput, fields: &[TokenStream2]) -> TokenS
                 syn::Fields::Named(named_fields) => {
                     fields.iter().for_each(|f|
                         named_fields.named.push(
-                            syn::Field::parse_named.parse2(f.clone()).unwrap()
+                            syn::Field::parse_named.parse2(f.clone()).expect("Cannot add field to struct")
                         )
                     );
                 }   
@@ -98,15 +120,21 @@ fn build_from_element_impl_for_element(descriptor: &ElementDescriptor) -> TokenS
             }
         );
     }
+
+    if let Some(_) = &descriptor.content {
+        from_element_body.push(quote!{            
+            content: element.text()
+        })
+    }
     
     // Attributes
     descriptor.attribute.iter().for_each(|att| {
-        let attr_name = &att.name;
+        let attr_name = &att.get_attribute_name();
         let attr_type = &att.r#type;
-        let s_attr_name = attr_name.to_string();
+        let s_attr_name = &att.name;
 
         from_element_body.push(quote! {
-            #attr_name: #attr_type :: from_str(el.attr(#s_attr_name).unwrap())?
+            #attr_name: crate::utils::FromAttributeValue::<#attr_type> :: from_attribute_value(element.attr(#s_attr_name).unwrap())
         });
     });
 
@@ -148,9 +176,17 @@ fn build_into_element_impl_for_element(struct_name: &syn::Ident, descriptor: &El
     // Build From<minidom::Element> impl for 
     let mut from_element_body: Vec<TokenStream2> = vec![];
     
-    from_element_body.push(quote!{
-        let mut builder = minidom::Element::builder(#name, #namespace);
-    });
+    if descriptor.setup_prefixes.is_some() {
+        from_element_body.push(quote!{
+            let mut builder = crate::ns::setup_prefixes(minidom::Element::builder(#name, #namespace));
+        });
+    
+    } else {
+        from_element_body.push(quote!{
+            let mut builder = minidom::Element::builder(#name, #namespace);
+        });
+    
+    }
 
     if let Some(_) = &descriptor.children {
         from_element_body.push(
@@ -162,13 +198,19 @@ fn build_into_element_impl_for_element(struct_name: &syn::Ident, descriptor: &El
         );
     }
 
+    if let Some(_) = &descriptor.content {
+        from_element_body.push(quote!{            
+            builder =  builder.append(self.content);
+        })       
+    }
+
     descriptor.attribute.iter().for_each(|att| {
-        let attr_name = &att.name;
-        let s_attr_name = attr_name.to_string();
+        let attr_name = &att.get_attribute_name();
+        let s_attr_name = &att.name;
         let attr_type = &att.r#type;
 
         from_element_body.push(quote! {
-            builder = builder.attr(#s_attr_name, crate::utils::IntoAttribute::<#attr_type>::into_attribute_value(self. #attr_name));
+            builder = builder.attr(#s_attr_name, crate::utils::IntoAttributeValue::<#attr_type>::into_attribute_value(self. #attr_name));
         });
     });
 
@@ -207,6 +249,10 @@ pub fn define_element(args: TokenStream, input: TokenStream) -> TokenStream
                 fields.push(quote! {pub children: Vec<#c>});
             }
 
+            if let Some(_) = &descriptor.content {
+                fields.push(quote! {pub content: String});
+            }
+
             for c in descriptor.child.iter() {
                 let attr_name = syn::Ident::new(&c.get_attribute_name(), c.r#type.get_ident().unwrap().span());
                 let attr_type = c.r#type.clone();
@@ -216,7 +262,7 @@ pub fn define_element(args: TokenStream, input: TokenStream) -> TokenStream
 
             // On crée les champs par rapport aux attributs attendus
             fields = descriptor.attribute.iter().fold(fields, |mut fields, attr| {
-                let attr_name = &attr.name;
+                let attr_name = &attr.get_attribute_name();
                 let attr_type = &attr.r#type;
                 
                 fields.push(
@@ -228,9 +274,25 @@ pub fn define_element(args: TokenStream, input: TokenStream) -> TokenStream
                 fields
             });
             
-            let ast = add_fields_to_struct(struct_ast.clone(), &fields);
-
+            let mut ast = add_fields_to_struct(struct_ast.clone(), &fields);
             let struct_name = struct_ast.ident.clone();
+
+            if let Some(children) = &descriptor.children 
+            {
+                
+                ast = quote! {
+                    #ast
+
+                    impl crate::element::OpenDocumentElementWithChildren<#children> for #struct_name {
+                        fn add_child(&mut self, child: impl Into<#children>)
+                        {
+                            self.children.push(child.into());
+                        }
+                    }
+                };
+            } 
+
+            
 
             // Implement OpenDocumentElement
             let open_document_element_impl = build_opendocumentnode_impl_for_element(&struct_name, &descriptor);
