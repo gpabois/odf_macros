@@ -56,13 +56,14 @@ struct ElementAttribute {
 
 impl ElementAttribute {
     pub fn get_attribute_name(&self) -> syn::Ident {
-        let name = self.name.to_case(Case::Snake);
-        if name == "type" {
-            return syn::Ident::new(&"ttype", self.r#type.span())
-        }
+        let name = format!("{}_{}", self.prefix, self.name).to_case(Case::Snake);
 
-        syn::Ident::new(&self.name.to_case(Case::Snake), self.r#type.span())
+        syn::Ident::new(&name, self.r#type.span())
         
+    }
+
+    pub fn get_xml_attribute_name(&self) -> String {
+        format!("{}:{}", self.prefix, self.name)
     }
 }
 
@@ -131,7 +132,7 @@ fn build_from_element_impl_for_element(descriptor: &ElementDescriptor) -> TokenS
     descriptor.attribute.iter().for_each(|att| {
         let attr_name = &att.get_attribute_name();
         let attr_type = &att.r#type;
-        let s_attr_name = &att.name;
+        let s_attr_name = att.get_xml_attribute_name();
 
         from_element_body.push(quote! {
             #attr_name: crate::utils::FromAttributeValue::<#attr_type> :: from_attribute_value(element.attr(#s_attr_name).unwrap())
@@ -206,7 +207,7 @@ fn build_into_element_impl_for_element(struct_name: &syn::Ident, descriptor: &El
 
     descriptor.attribute.iter().for_each(|att| {
         let attr_name = &att.get_attribute_name();
-        let s_attr_name = &att.name;
+        let s_attr_name = &att.get_xml_attribute_name();
         let attr_type = &att.r#type;
 
         from_element_body.push(quote! {
