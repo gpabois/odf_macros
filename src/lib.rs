@@ -1,6 +1,7 @@
 extern crate darling;
 extern crate proc_macro;
 
+use convert_case::{Case, Casing};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use syn::{parse_macro_input, DeriveInput, parse::Parser, AttributeArgs};
@@ -17,15 +18,29 @@ struct ElementDescriptor {
     name: String,
 
     #[darling(multiple)]
-    attributes: Vec<ElementAttribute>,
+    attribute: Vec<ElementAttribute>,
     
-    children: Option<syn::Path>
+    children: Option<syn::Path>,
+
+    #[darling(multiple)]
+    child: Vec<ElementChild>
+}
+
+#[derive(FromMeta, Debug)]
+struct ElementChild {
+    r#type: syn::Path
+}
+
+impl ElementChild {
+    pub fn get_attribute_name(&self) -> String {
+        self.r#type.get_ident().unwrap().to_string().to_case(Case::Snake)
+    }
 }
 
 #[derive(FromMeta, Debug)]
 struct ElementAttribute {
     name: syn::Ident,
-    att_type: syn::Ident,
+    r#type: syn::Ident,
     prefix: String
 }
 
@@ -59,7 +74,7 @@ fn build_opendocumentnode_impl_for_element(struct_name: &syn::Ident, descriptor:
     let from_element_impl = build_from_element_impl_for_element(descriptor);
 
     quote! {
-        impl OpenDocumentElement for #struct_name 
+        impl crate::element::OpenDocumentElement for #struct_name 
         {
             fn is_element(el: &minidom::Element) -> bool {
                 el.is(#name, #namespace)
@@ -71,33 +86,54 @@ fn build_opendocumentnode_impl_for_element(struct_name: &syn::Ident, descriptor:
 }
 
 fn build_from_element_impl_for_element(descriptor: &ElementDescriptor) -> TokenStream2 {
-    let mut into_element_body: Vec<TokenStream2> = vec![];
+    let mut from_element_body: Vec<TokenStream2> = vec![];
     
+    // If a children is defined
     if let Some(t) = &descriptor.children {
-        into_element_body.push(
+        from_element_body.push(
             quote!{            
-                children: el.children().map(|c| {
-                    #t :: from_element(c)?
-                }).collect()
+                children: element.children().map(|c| {
+                    #t :: from_element(c)
+                }).collect::<Result<_, _>>()?
             }
         );
     }
     
-    descriptor.attributes.iter().for_each(|att| {
+    // Attributes
+    descriptor.attribute.iter().for_each(|att| {
         let attr_name = &att.name;
-        let attr_type = &att.att_type;
+        let attr_type = &att.r#type;
         let s_attr_name = attr_name.to_string();
 
-        into_element_body.push(quote! {
+        from_element_body.push(quote! {
             #attr_name: #attr_type :: from_str(el.attr(#s_attr_name).unwrap())?
         });
     });
 
+    // Child element
+    descriptor.child.iter().for_each(|c| {
+        let attr_name = syn::Ident::new(&c.get_attribute_name(), c.r#type.get_ident().unwrap().span());
+        let attr_type = &c.r#type;
+        let s_attr_type = attr_type.segments.to_token_stream().to_string();
+
+        from_element_body.push(quote! {
+            #attr_name: #attr_type :: from_element (
+                crate::utils::find_child_element::<#attr_type>(element).ok_or(
+                    crate::Error::from(
+                        crate::ParsingError::missing_element(
+                            #s_attr_type.to_string()
+                        )
+                    )
+                )?
+            )?
+        });        
+    });
+
     quote!{
-        fn from_element(el: &minidom::Element) -> crate::Result<Self> {
+        fn from_element(element: &minidom::Element) -> crate::Result<Self> {
             Ok(
                 Self {
-                    #(#into_element_body),
+                    #(#from_element_body),
                     *
                 }
             )
@@ -111,6 +147,7 @@ fn build_into_element_impl_for_element(struct_name: &syn::Ident, descriptor: &El
 
     // Build From<minidom::Element> impl for 
     let mut from_element_body: Vec<TokenStream2> = vec![];
+    
     from_element_body.push(quote!{
         let mut builder = minidom::Element::builder(#name, #namespace);
     });
@@ -125,11 +162,21 @@ fn build_into_element_impl_for_element(struct_name: &syn::Ident, descriptor: &El
         );
     }
 
-    descriptor.attributes.iter().for_each(|att| {
+    descriptor.attribute.iter().for_each(|att| {
         let attr_name = &att.name;
         let s_attr_name = attr_name.to_string();
+        let attr_type = &att.r#type;
+
         from_element_body.push(quote! {
-            builder = builder.attr(#s_attr_name, self. #attr_name);
+            builder = builder.attr(#s_attr_name, crate::utils::IntoAttribute::<#attr_type>::into_attribute_value(self. #attr_name));
+        });
+    });
+
+    descriptor.child.iter().for_each(|c| {
+        let attr_name = syn::Ident::new(&c.get_attribute_name(), c.r#type.get_ident().unwrap().span());
+       
+        from_element_body.push(quote! {
+            builder = builder.append(self. #attr_name);
         });
     });
 
@@ -160,10 +207,17 @@ pub fn define_element(args: TokenStream, input: TokenStream) -> TokenStream
                 fields.push(quote! {pub children: Vec<#c>});
             }
 
+            for c in descriptor.child.iter() {
+                let attr_name = syn::Ident::new(&c.get_attribute_name(), c.r#type.get_ident().unwrap().span());
+                let attr_type = c.r#type.clone();
+
+                fields.push(quote! {pub #attr_name: #attr_type});
+            }
+
             // On crée les champs par rapport aux attributs attendus
-            fields = descriptor.attributes.iter().fold(fields, |mut fields, attr| {
+            fields = descriptor.attribute.iter().fold(fields, |mut fields, attr| {
                 let attr_name = &attr.name;
-                let attr_type = &attr.att_type;
+                let attr_type = &attr.r#type;
                 
                 fields.push(
                     quote!{
@@ -226,7 +280,7 @@ pub fn define_child_elements(args: TokenStream, input: TokenStream) -> TokenStre
 
                 enum_data.variants.push(
                     syn::parse_str::<syn::Variant>(&format!("{}({})", arg_name, type_name)).unwrap_or_else(
-                        |t|
+                        |_t|
                         panic!("{}", arg_name)
                     )
                 );
@@ -261,7 +315,11 @@ pub fn define_child_elements(args: TokenStream, input: TokenStream) -> TokenStre
             #ast
 
             if #t::is_element(element) {
-                return Ok(Self::from(#t::from_element(element)?));
+                return Ok(
+                    Self::from(
+                        #t::from_element(element)?
+                    )
+                );
             }
             
         }
@@ -273,7 +331,7 @@ pub fn define_child_elements(args: TokenStream, input: TokenStream) -> TokenStre
     };
     
     let from_element = quote!(
-        impl OpenDocumentElement for #enum_id {
+        impl crate::element::OpenDocumentElement for #enum_id {
             fn is_element(element: &minidom::Element) -> bool {
                 true
             }
