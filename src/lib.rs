@@ -135,7 +135,7 @@ fn build_from_element_impl_for_element(descriptor: &ElementDescriptor) -> TokenS
         let s_attr_name = att.get_xml_attribute_name();
 
         from_element_body.push(quote! {
-            #attr_name: crate::utils::FromAttributeValue::<#attr_type> :: from_attribute_value(element.attr(#s_attr_name).unwrap())
+            #attr_name: element.attr(#s_attr_name).map(crate::utils::FromAttributeValue::<#attr_type> :: from_attribute_value)
         });
     });
 
@@ -211,7 +211,10 @@ fn build_into_element_impl_for_element(struct_name: &syn::Ident, descriptor: &El
         let attr_type = &att.r#type;
 
         from_element_body.push(quote! {
-            builder = builder.attr(#s_attr_name, crate::utils::IntoAttributeValue::<#attr_type>::into_attribute_value(self. #attr_name));
+            if let Some(value) = self. #attr_name {
+                builder = builder.attr(#s_attr_name, crate::utils::IntoAttributeValue::<#attr_type>::into_attribute_value(value)); 
+            }
+            
         });
     });
 
@@ -268,7 +271,7 @@ pub fn define_element(args: TokenStream, input: TokenStream) -> TokenStream
                 
                 fields.push(
                     quote!{
-                        pub #attr_name: #attr_type
+                        pub #attr_name: Option<#attr_type>
                     }
                 );
 
